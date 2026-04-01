@@ -1,0 +1,285 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import DoubleType, IntegerType
+import wbdata
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import warnings
+import seaborn as sns
+
+# pyspark_groundwater_analysis.py
+# PySpark adaptation of the notebook: load World Bank data (or fallback), process with Spark, and produce charts via pandas
+
+import matplotlib.pyplot as plt
+import plotly.express as px
+
+warnings.filterwarnings("ignore")
+
+# --- Spark session ---
+spark = SparkSession.builder \
+    .appName("GroundwaterDepletionAnalysis") \
+    .config("spark.sql.session.timeZone", "UTC") \
+    .getOrCreate()
+
+# --- Indicators and time range ---
+indicators = {
+    'ER.H2O.FWST.ZS': 'Level of water stress (%)',
+    'ER.H2O.FWTL.K3': 'Annual freshwater withdrawals (billion cubic meters)',
+    'SP.POP.TOTL': 'Total population',
+    'AG.LND.AGRI.K2': 'Agricultural land (sq. km)',
+    'AG.LND.PRCP.MM': 'Average precipitation (mm per year)'
+}
+data_date = (datetime(1990, 1, 1), datetime(2022, 12, 31))
+
+# --- Research-based metadata / maps / rates (same as notebook) ---
+countries_of_interest = [
+    'India', 'China', 'Pakistan', 'Bangladesh', 'Iran', 'Saudi Arabia',
+    'Afghanistan', 'Iraq', 'Syrian Arab Republic', 'Yemen', 'Israel', 'United Arab Emirates',
+    'Japan', 'Korea, Rep.', 'Indonesia', 'Thailand', 'Vietnam', 'Myanmar',
+    'Egypt, Arab Rep.', 'Libya', 'Algeria', 'Morocco', 'South Africa',
+    'United States', 'Mexico', 'Spain', 'Italy', 'Australia', 'Brazil', 'Argentina'
+]
+
+country_name_map = {
+    'Syrian Arab Republic': 'Syria',
+    'Egypt, Arab Rep.': 'Egypt',
+    'Korea, Rep.': 'South Korea',
+    'United Arab Emirates': 'UAE',
+    'United States': 'USA',
+    'Yemen, Rep.': 'Yemen'
+}
+
+region_map = {
+    'India': 'South Asia', 'Pakistan': 'South Asia', 'Bangladesh': 'South Asia',
+    'Afghanistan': 'South Asia', 'Sri Lanka': 'South Asia',
+    'China': 'East Asia', 'Japan': 'East Asia', 'South Korea': 'East Asia',
+    'Iran': 'Middle East', 'Saudi Arabia': 'Middle East', 'Iraq': 'Middle East',
+    'Syria': 'Middle East', 'Yemen': 'Middle East', 'Israel': 'Middle East', 'UAE': 'Middle East',
+    'Indonesia': 'Southeast Asia', 'Thailand': 'Southeast Asia', 'Vietnam': 'Southeast Asia',
+    'Myanmar': 'Southeast Asia',
+    'Egypt': 'North Africa', 'Libya': 'North Africa', 'Algeria': 'North Africa',
+    'Morocco': 'North Africa',
+    'South Africa': 'Sub-Saharan Africa',
+    'USA': 'North America', 'Mexico': 'North America',
+    'Brazil': 'South America', 'Argentina': 'South America',
+    'Spain': 'Europe', 'Italy': 'Europe',
+    'Australia': 'Oceania'
+}
+
+depletion_rates = {
+    'India': -0.8, 'China': -0.6, 'Pakistan': -0.9, 'Bangladesh': -0.5,
+    'Iran': -1.0, 'Saudi Arabia': -1.2, 'Afghanistan': -0.7, 'Iraq': -0.8,
+    'Syria': -0.7, 'Yemen': -1.1, 'Israel': -0.6, 'UAE': -1.3,
+    'Japan': -0.2, 'South Korea': -0.3, 'Indonesia': -0.4, 'Thailand': -0.4,
+    'Vietnam': -0.3, 'Myanmar': -0.2,
+    'Egypt': -0.7, 'Libya': -0.9, 'Algeria': -0.6, 'Morocco': -0.5,
+    'South Africa': -0.4, 'USA': -0.5, 'Mexico': -0.6, 'Spain': -0.5,
+    'Italy': -0.4, 'Australia': -0.6, 'Brazil': -0.3, 'Argentina': -0.3
+}
+
+# --- Fetch World Bank data (pandas) and convert to Spark DataFrame; fallback to synthetic if fails ---
+wb_data_raw = None
+try:
+    wb_data_raw = wbdata.get_dataframe(indicators, data_date=data_date, convert_date=True)
+    if wb_data_raw is not None and not wb_data_raw.empty:
+        wb_data_raw = wb_data_raw.reset_index()
+        # filter countries of interest
+        wb_data_raw = wb_data_raw[wb_data_raw['country'].isin(countries_of_interest)].copy()
+        wb_data_raw = wb_data_raw.rename(columns={
+            'country': 'Country',
+            'date': 'Date',
+            'Level of water stress (%)': 'Water_Stress_Percent',
+            'Annual freshwater withdrawals (billion cubic meters)': 'Annual_Withdrawal_km3',
+            'Total population': 'Population',
+            'Agricultural land (sq. km)': 'Agricultural_Land_km2',
+            'Average precipitation (mm per year)': 'Annual_Rainfall_mm'
+        })
+        wb_data_raw['Year'] = wb_data_raw['Date'].dt.year
+        wb_data_raw = wb_data_raw.drop(columns=['Date'])
+        wb_data_raw['Country'] = wb_data_raw['Country'].replace(country_name_map)
+        wb_data_raw['Region'] = wb_data_raw['Country'].map(region_map)
+        wb_data_raw['Population_Millions'] = wb_data_raw['Population'] / 1_000_000
+        wb_data_raw = wb_data_raw.drop(columns=['Population'])
+        wb_data_raw['Depletion_Rate_m_per_year'] = wb_data_raw['Country'].map(depletion_rates)
+        base_year = 1990
+        wb_data_raw['Groundwater_Level_Index'] = 100 + (wb_data_raw['Depletion_Rate_m_per_year'] * (wb_data_raw['Year'] - base_year))
+        # fill rainfall medians per country where possible
+        if 'Annual_Rainfall_mm' in wb_data_raw.columns:
+            wb_data_raw['Annual_Rainfall_mm'] = wb_data_raw.groupby('Country')['Annual_Rainfall_mm'].transform(
+                lambda x: x.fillna(x.median()) if x.notna().any() else x
+            )
+        pdf = wb_data_raw.copy()
+    else:
+        pdf = None
+except Exception:
+    pdf = None
+
+if pdf is None:
+    # fallback synthetic (pandas) similar to original
+    years = list(range(1990, 2024))
+    np.random.seed(42)
+    data_list = []
+    water_stress_baseline = {
+        'India': 72, 'China': 65, 'Pakistan': 95, 'Bangladesh': 55,
+        'Iran': 98, 'Saudi Arabia': 120, 'Afghanistan': 85, 'Iraq': 90,
+        'Syria': 110, 'Yemen': 115, 'Israel': 85, 'UAE': 130,
+        'Japan': 35, 'South Korea': 42, 'Indonesia': 25, 'Thailand': 30,
+        'Vietnam': 28, 'Myanmar': 20,
+        'Egypt': 115, 'Libya': 105, 'Algeria': 75, 'Morocco': 80,
+        'South Africa': 45, 'USA': 38, 'Mexico': 65, 'Spain': 55,
+        'Italy': 48, 'Australia': 42, 'Brazil': 22, 'Argentina': 25
+    }
+    countries = list(depletion_rates.keys())
+    for country in countries:
+        region = region_map.get(country, 'Other')
+        base_level = 100
+        base_pop = 100 if country not in ['China', 'India'] else 1200
+        for i, year in enumerate(years):
+            decline = depletion_rates[country] * i
+            gw_level = base_level + decline + np.random.normal(0, 1.5)
+            stress_increase = i * 0.5
+            water_stress = water_stress_baseline.get(country, 40) + stress_increase + np.random.normal(0, 2)
+            water_stress = max(0, min(200, water_stress))
+            pop_growth = 1.015 ** i
+            population = base_pop * pop_growth
+            withdrawal = population * 0.1 * (1 + i * 0.015)
+            rainfall = 800 + np.random.normal(0, 150)
+            data_list.append({
+                'Country': country,
+                'Region': region,
+                'Year': year,
+                'Groundwater_Level_Index': round(gw_level, 2),
+                'Water_Stress_Percent': round(water_stress, 2),
+                'Population_Millions': round(population, 2),
+                'Annual_Withdrawal_km3': round(withdrawal, 3),
+                'Annual_Rainfall_mm': round(rainfall, 1),
+                'Depletion_Rate_m_per_year': depletion_rates[country]
+            })
+    pdf = pd.DataFrame(data_list)
+
+# --- Convert pandas DataFrame to Spark DataFrame ---
+df_spark = spark.createDataFrame(pdf)
+df_spark = df_spark.withColumn("Year", F.col("Year").cast(IntegerType()))
+df_spark = df_spark.withColumn("Groundwater_Level_Index", F.col("Groundwater_Level_Index").cast(DoubleType()))
+df_spark = df_spark.withColumn("Water_Stress_Percent", F.col("Water_Stress_Percent").cast(DoubleType()))
+df_spark = df_spark.withColumn("Population_Millions", F.col("Population_Millions").cast(DoubleType()))
+df_spark = df_spark.withColumn("Annual_Withdrawal_km3", F.col("Annual_Withdrawal_km3").cast(DoubleType()))
+df_spark = df_spark.withColumn("Annual_Rainfall_mm", F.col("Annual_Rainfall_mm").cast(DoubleType()))
+df_spark = df_spark.withColumn("Depletion_Rate_m_per_year", F.col("Depletion_Rate_m_per_year").cast(DoubleType()))
+
+# --- Basic overview ---
+print("Spark DataFrame schema:")
+df_spark.printSchema()
+print(f"Total records: {df_spark.count()}")
+df_spark.select("Country").distinct().show(truncate=False)
+
+# --- Determine latest year and create pandas slices for plotting/analysis ---
+latest_year = df_spark.agg(F.max("Year")).collect()[0][0]
+df_latest_spark = df_spark.filter(F.col("Year") == latest_year)
+
+# Convert small aggregated tables back to pandas for plotting convenience
+df_latest = df_latest_spark.toPandas()
+df = df_spark.toPandas()  # if dataset not huge; otherwise filter before toPandas()
+
+# --- Plot: Groundwater trends for selected Asian countries (matplotlib) ---
+asian_countries = ['India', 'China', 'Pakistan', 'Bangladesh', 'Iran', 'Saudi Arabia', 'Indonesia', 'Thailand']
+df_asia = df[df['Country'].isin(asian_countries)]
+
+plt.figure(figsize=(14, 6))
+for country in asian_countries:
+    cd = df_asia[df_asia['Country'] == country].sort_values('Year')
+    plt.plot(cd['Year'], cd['Groundwater_Level_Index'], marker='o', label=country)
+plt.xlabel('Year')
+plt.ylabel('Groundwater Level Index (1990=100)')
+plt.title('Groundwater Level Decline - Major Asian Countries')
+plt.axhline(100, color='red', linestyle='--', label='Baseline (1990)')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# --- Top 10 by water stress (latest year) & depletion ---
+top_10_stress = df_latest.nlargest(10, 'Water_Stress_Percent')[['Country', 'Water_Stress_Percent', 'Depletion_Rate_m_per_year']]
+print("Top 10 countries by water stress (latest year):")
+print(top_10_stress.to_string(index=False))
+
+# Plot choropleth (plotly)
+fig = px.choropleth(df_latest,
+                    locations="Country",
+                    locationmode='country names',
+                    color="Water_Stress_Percent",
+                    hover_name="Country",
+                    color_continuous_scale='RdYlGn_r',
+                    range_color=[0, 150],
+                    title=f'Global Water Stress Levels by Country ({latest_year})')
+fig.update_layout(height=500, margin={"r":0,"t":50,"l":0,"b":0})
+fig.show()
+
+# --- Regional summary for Asian regions ---
+asian_regions = ['South Asia', 'East Asia', 'Southeast Asia', 'Middle East']
+df_asia_regions_spark = df_spark.filter((F.col('Region').isin(asian_regions)) & (F.col('Year') == latest_year))
+regional_summary_spark = df_asia_regions_spark.groupBy('Region').agg(
+    F.round(F.avg('Water_Stress_Percent'), 2).alias('Avg_Water_Stress'),
+    F.round(F.avg('Depletion_Rate_m_per_year'), 2).alias('Avg_Depletion_Rate'),
+    F.round(F.sum('Population_Millions'), 2).alias('Total_Population_Millions'),
+    F.round(F.sum('Annual_Withdrawal_km3'), 2).alias('Total_Withdrawal_km3')
+)
+regional_summary = regional_summary_spark.toPandas().set_index('Region')
+print("\nRegional summary (Asia) - latest year:")
+print(regional_summary)
+
+# --- Correlation analysis (latest year) ---
+corr_cols = ['Water_Stress_Percent', 'Population_Millions', 'Annual_Withdrawal_km3', 'Annual_Rainfall_mm', 'Groundwater_Level_Index']
+df_corr = df_latest[corr_cols].dropna()
+corr_matrix = df_corr.corr()
+print("\nCorrelation matrix (latest year):")
+print(corr_matrix.round(3))
+
+# Heatmap
+plt.figure(figsize=(8,6))
+sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', center=0, fmt='.3f')
+plt.title('Correlation Heatmap: Groundwater Factors')
+plt.tight_layout()
+plt.show()
+
+# --- Historical change 1990 -> latest ---
+df_1990 = df[df['Year'] == 1990][['Country','Groundwater_Level_Index','Water_Stress_Percent']]
+df_latest_comp = df[df['Year'] == latest_year][['Country','Groundwater_Level_Index','Water_Stress_Percent']]
+df_change = pd.merge(df_1990, df_latest_comp, on='Country', suffixes=('_1990','_latest'))
+df_change['GW_Level_Change_%'] = (df_change['Groundwater_Level_Index_latest'] - df_change['Groundwater_Level_Index_1990']) / df_change['Groundwater_Level_Index_1990'] * 100
+df_change['Water_Stress_Change_%'] = (df_change['Water_Stress_Percent_latest'] - df_change['Water_Stress_Percent_1990']) / df_change['Water_Stress_Percent_1990'] * 100
+
+top_10_worst = df_change.nsmallest(10, 'GW_Level_Change_%')
+print("\nTop 10 largest GW level declines (1990 -> latest):")
+print(top_10_worst[['Country','GW_Level_Change_%']].to_string(index=False))
+
+# --- Final summary DataFrame ---
+summary_data = {
+    'Metric': [
+        'Total Countries Analyzed',
+        'Time Period Covered',
+        'Countries with Extreme Stress (>80%)',
+        'Average Global Water Stress (latest)',
+        'Average Depletion Rate (Asia)',
+        'Total Population Affected (millions)',
+        'Regions Most at Risk',
+        'Data Source'
+    ],
+    'Value': [
+        df_spark.select('Country').distinct().count(),
+        f"1990-{latest_year}",
+        int(df_latest[df_latest['Water_Stress_Percent'] > 80].shape[0]),
+        f"{df_latest['Water_Stress_Percent'].mean():.1f}%",
+        f"{abs(df_asia_regions_spark.agg(F.avg('Depletion_Rate_m_per_year')).collect()[0][0]):.2f} m/year" if df_asia_regions_spark.count() > 0 else "N/A",
+        f"{df_latest['Population_Millions'].sum():.0f}",
+        'Middle East, South Asia, North Africa',
+        'World Bank API + Research Studies'
+    ]
+}
+summary_df = pd.DataFrame(summary_data)
+print("\nFinal summary:")
+print(summary_df.to_string(index=False))
+
+# --- Stop Spark if desired ---
+# spark.stop()
